@@ -12,4 +12,4 @@ service: $(SRC)/main.cpp
 .PHONY: clean
 
 clean:
-	-rm  main
+	-rm  service
