@@ -4,19 +4,122 @@
 #include <seastar/net/api.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/distributed.hh>
+#include <boost/asio.hpp>
+#include <redisclient/redissyncclient.h>
 
 #include <iostream>
 
 using namespace seastar;
 using namespace net;
 
+using namespace redisclient;
+
+class rediscli
+{
+public:
+    bool init(const std::string &ip = "127.0.0.1", const uint16_t &port = 6379, const std::string &passwd = "")
+    {
+        if (_init)
+            return _init;
+        _ip = ip;
+        _port = port;
+        _passwd = passwd;
+        _init = _connect();
+        return _init;
+    }
+    bool command(const std::string &cmd, const std::deque<RedisBuffer> &args, RedisValue &result)
+    {
+        bool ret = false;
+        int try_times = 0;
+        do
+        {
+            try
+            {
+                result = _cli->command(cmd, args);
+                ret = result.isOk();
+                if (!ret)
+                {
+                    std::cerr << "failed to excute command. error = " << result.toString().c_str() << "\n";
+                }
+                break;
+            }
+            catch (std::exception &e)
+            {
+                std::cerr << "exception on excute redis command " << e.what() << "\n";
+            }
+            if (!_cli->isConnected())
+                _connect();
+
+            try_times++;
+        } while (try_times < 3);
+
+        return ret;
+    }
+
+private:
+    bool _connect()
+    {
+        _cli.reset(new RedisSyncClient(_io_service));
+
+        bool ret = false;
+        try
+        {
+            boost::asio::ip::address addr = boost::asio::ip::address::from_string(_ip);
+            boost::asio::ip::tcp::endpoint endpoint(addr, _port);
+            boost::system::error_code ec;
+            _cli->connect(endpoint, ec);
+            if (ec)
+            {
+                std::cerr << "Can't connect to redis: " << ec.message() << std::endl;
+                return ret;
+            }
+            if (!_passwd.empty())
+            {
+                RedisValue result = _cli->command("AUTH", {_passwd});
+                ret = result.isOk();
+            }
+            else
+            {
+                ret = true;
+            }
+        }
+        catch (boost::system::error_code &e)
+        {
+            std::cerr << "excepion = " << e.message().c_str() << "\n";
+        }
+        catch (...)
+        {
+            std::cerr << "excepion" << std::endl;
+        }
+        return ret;
+    }
+
+private:
+    std::string _ip;
+    uint16_t _port;
+    std::string _passwd;
+    bool _init = false;
+    boost::asio::io_service _io_service;
+    std::shared_ptr<RedisSyncClient> _cli;
+};
+
+class tcp_server;
+
 class protocol
 {
-
 public:
-    future<> handle(input_stream<char> &in, output_stream<char> &out)
+    
+    future<> handle(/*tcp_server *server,*/ input_stream<char> &in, output_stream<char> &out)
     {
-        return in.read().then([&out](auto buf) {
+        // if(!server)
+        //     return make_ready_future<>();
+
+        // lw_shared_ptr<rediscli> cli(server->cli());
+
+        return in.read().then([&out/*, &cli*/](auto buf) {
+                            // std::string str(buf.begin(), buf.end());
+                            // RedisValue val;
+                            // cli->command("set", {str, "1"}, val);
                             return out.write(std::move(buf));
                         })
             .then_wrapped([this, &out](auto &&f) -> future<> {
@@ -55,10 +158,12 @@ public:
     }
     void start()
     {
+        _cli = make_lw_shared<rediscli>();
+        _cli->init();
+
         listen_options lo;
         lo.reuse_address = true;
         _listener = seastar::api_v2::server_socket(seastar::listen(make_ipv4_address(_addr), lo));
-        // Run in the background until eof has reached on the input connection.
         _task = keep_doing([this] {
             return _listener->accept().then([this](accept_result ar) mutable {
                 connected_socket socket = std::move(ar.connection);
@@ -82,11 +187,19 @@ public:
             std::cerr << "exception in tcp_server " << e << '\n';
         });
     }
-
+    bool storage(const std::string &key){
+        RedisValue val;
+        _cli->command("set", {key, "1"}, val);
+        return true;
+    }
+    lw_shared_ptr<rediscli> cli(){
+        return _cli;
+    }
 private:
     ipv4_addr _addr;
     compat::optional<future<>> _task;
     lw_shared_ptr<seastar::api_v2::server_socket> _listener;
+    lw_shared_ptr<rediscli> _cli;
 };
 
 namespace bpo = boost::program_options;
@@ -112,4 +225,9 @@ int main(int argc, char **argv)
                 std::cout << "Seastar TCP server listening on port " << port << " ...\n";
             });
     });
+    // rediscli cli;
+    // cli.init();
+    // RedisValue val;
+    // for (int i = 0; i < 100000; i++)
+    //     cli.command("set", {std::to_string(i), std::to_string(i)}, val);
 }
